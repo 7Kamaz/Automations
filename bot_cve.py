@@ -127,13 +127,12 @@ def coletar_cves() -> list:
     agora  = datetime.now(timezone.utc)
     inicio = agora - timedelta(minutes=NVD_LOOKBACK_MINUTES)
 
-    # pubStartDate/pubEndDate = só CVEs PUBLICADAS na janela (não modificadas)
     params_base = {
-        "pubStartDate":    iso_z(inicio),
-        "pubEndDate":      iso_z(agora),
-        "resultsPerPage":  NVD_RESULTS_PER_PAGE,
-        "startIndex":      0,
-        "noRejected":      "true",
+        "lastModStartDate": iso_z(inicio),
+        "lastModEndDate":   iso_z(agora),
+        "resultsPerPage":   NVD_RESULTS_PER_PAGE,
+        "startIndex":       0,
+        "noRejected":       "true",
     }
 
     cves         = []
@@ -181,11 +180,20 @@ def coletar_cves() -> list:
                     except (KeyError, IndexError, TypeError):
                         continue
 
+            published = cve_data.get("published", "")
+            # Ignora CVEs antigas — NVD retorna históricas quando modified recentemente
+            try:
+                if published and int(published[:4]) < 2020:
+                    print(f"⏭️  Ignorando {cve_id} (publicada em {published[:4]})")
+                    continue
+            except Exception:
+                pass
+
             cves.append({
                 "id":        cve_id,
                 "summary":   summary,
                 "cvss":      cvss,
-                "published": cve_data.get("published"),
+                "published": published,
             })
 
         start_index += len(vulnerabilities)
