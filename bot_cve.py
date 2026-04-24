@@ -1,3 +1,10 @@
+"""
+bot_cve.py — Kamaz Intel Bot v4.0
+Fonte: NVD API v2.0
+Pipeline: NVD → Groq (llama-3.3-70b-versatile) → Supabase (news_articles) → Discord
+GitHub Actions: roda a cada hora via cron "0 * * * *"
+"""
+
 import json
 import os
 import re
@@ -12,270 +19,368 @@ from supabase import create_client
 load_dotenv()
 
 # =========================
-# CONFIG
+# CONFIG — todos os secrets
 # =========================
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_URL              = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+GROQ_API_KEY              = os.getenv("GROQ_API_KEY")
+GROQ_MODEL                = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DISCORD_WEBHOOK           = os.getenv("DISCORD_WEBHOOK_URL")
+AUTO_PUBLISH              = os.getenv("AUTO_PUBLISH", "false").strip().lower() in {"1", "true", "yes", "y"}
 
-AUTO_PUBLISH = os.getenv("AUTO_PUBLISH", "false").lower() in {"1", "true", "yes"}
-
-NVD_BASE = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0/")
-if not NVD_BASE.endswith("/"):
-    NVD_BASE += "/"
-
-NVD_API_KEY = os.getenv("NVD_API_KEY")
+# NVD
+_nvd_base          = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0/")
+NVD_API_URL        = _nvd_base if _nvd_base.endswith("/") else _nvd_base + "/"
+NVD_API_KEY        = os.getenv("NVD_API_KEY")          # opcional mas aumenta rate limit
 NVD_RESULTS_PER_PAGE = int(os.getenv("NVD_RESULTS_PER_PAGE", "20"))
+NVD_URL_TEMPLATE   = "https://nvd.nist.gov/vuln/detail/{cve_id}"
 
-HEADERS = {
-    "User-Agent": "kamaz-intel-bot/3.1",
-    "Accept": "application/json",
-}
+# Conjuntos de validação para payload da IA
+ALLOWED_SEVERITIES  = {"critical", "high", "medium", "low", "info"}
+ALLOWED_VECTOR      = {"Rede", "Local", "Adjacente", "Físico", "Desconhecido"}
+ALLOWED_COMPLEXITY  = {"Baixa", "Média", "Alta", "Desconhecida"}
+ALLOWED_AUTH        = {"Nenhuma", "Usuário", "Administrador", "Desconhecida"}
 
-session = requests.Session()
+HEADERS = {"User-Agent": "kamaz-intel-bot/4.0", "Accept": "application/json"}
+
+# Estado global
+supabase    = None
+groq_client = None
+session     = requests.Session()
 session.headers.update(HEADERS)
-
 if NVD_API_KEY:
     session.headers.update({"apiKey": NVD_API_KEY})
 
-supabase = None
-groq_client = None
-
 
 # =========================
-# INIT
+# INICIALIZAÇÃO
 # =========================
 def init_clients():
     global supabase, groq_client
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Erro Supabase")
-
+        raise RuntimeError("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados")
     if not GROQ_API_KEY:
-        raise RuntimeError("Erro Groq")
+        raise RuntimeError("GROQ_API_KEY não configurada")
 
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    supabase    = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     groq_client = Groq(api_key=GROQ_API_KEY)
+    print("✅ Clientes inicializados")
 
 
 # =========================
 # HELPERS
 # =========================
-def now_iso():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def severity_from_cvss(cvss):
+def normalizar_texto(valor, padrao: str = "") -> str:
+    if valor is None:
+        return padrao
+    if isinstance(valor, str):
+        return valor.strip()
+    return str(valor).strip()
+
+
+def severity_from_cvss(cvss) -> str:
     try:
+        if cvss is None or cvss == "":
+            return "info"
         score = float(cvss)
-        if score >= 9: return "critical"
-        if score >= 7: return "high"
-        if score >= 4: return "medium"
-        if score > 0: return "low"
-    except:
+        if score >= 9.0: return "critical"
+        if score >= 7.0: return "high"
+        if score >= 4.0: return "medium"
+        if score > 0:    return "low"
+    except Exception:
         pass
     return "info"
 
 
-def clean_json(raw):
+def clean_json_text(raw: str) -> str:
+    """Remove blocos markdown e isola o objeto JSON."""
+    if not raw:
+        return ""
     raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?", "", raw)
-    raw = re.sub(r"```$", "", raw)
-
+    # Remove cercas ```json ... ``` ou ``` ... ```
+    if "```" in raw:
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE | re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
+        raw = raw.strip()
+    # Isola {…} caso a IA adicione texto antes/depois
     start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1:
-        raw = raw[start:end+1]
-
-    return raw
+    end   = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        raw = raw[start:end + 1]
+    return raw.strip()
 
 
 # =========================
-# NVD
+# NVD — COLETA
 # =========================
-def coletar_cves():
-    print("📡 NVD...")
+def coletar_cves() -> list:
+    print("📡 Coletando CVEs do NVD...")
+    params = {"resultsPerPage": NVD_RESULTS_PER_PAGE}
 
     try:
-        resp = session.get(NVD_BASE, params={"resultsPerPage": NVD_RESULTS_PER_PAGE}, timeout=20)
+        resp = session.get(NVD_API_URL, params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        print("Erro NVD:", e)
+        print(f"❌ Erro ao buscar CVEs do NVD: {e}")
         return []
 
     cves = []
-
     for item in data.get("vulnerabilities", []):
-        c = item.get("cve", {})
+        cve_data = item.get("cve", {})
+        cve_id   = cve_data.get("id")
+        if not cve_id:
+            continue
 
-        cve_id = c.get("id")
-        desc = next((d["value"] for d in c.get("descriptions", []) if d["lang"] == "en"), "")
+        # Descrição em inglês
+        summary = next(
+            (d["value"] for d in cve_data.get("descriptions", []) if d["lang"] == "en"),
+            ""
+        )
 
-        metrics = c.get("metrics", {})
-        cvss = None
-
-        for k in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
-            if k in metrics and metrics[k]:
-                cvss = metrics[k][0]["cvssData"]["baseScore"]
-                break
+        # CVSS — tenta v3.1, v3.0, v2 em ordem
+        metrics = cve_data.get("metrics", {})
+        cvss    = None
+        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            if key in metrics and metrics[key]:
+                try:
+                    cvss = metrics[key][0]["cvssData"]["baseScore"]
+                    break
+                except (KeyError, IndexError):
+                    continue
 
         cves.append({
-            "id": cve_id,
-            "summary": desc,
-            "cvss": cvss,
-            "published": c.get("published")
+            "id":        cve_id,
+            "summary":   summary,
+            "cvss":      cvss,
+            "published": cve_data.get("published"),
         })
 
+    print(f"📦 {len(cves)} CVEs recebidas")
     return cves
 
 
 # =========================
-# DUPLICIDADE
+# DEDUPLICAÇÃO
 # =========================
-def cve_exists(cve_id):
+def cve_ja_existe(cve_id: str) -> bool:
+    """Consulta Supabase ANTES de chamar a IA para evitar gasto de cota."""
     try:
         res = supabase.table("news_articles").select("id").eq("cve_id", cve_id).limit(1).execute()
-        return bool(res.data)
-    except:
-        return False
+        return bool(getattr(res, "data", None))
+    except Exception as e:
+        print(f"⚠️  Falha ao verificar duplicidade de {cve_id}: {e}")
+        return False  # Em caso de erro, tenta processar mesmo assim
 
 
 # =========================
-# LLM
+# VALIDAÇÃO DO PAYLOAD DA IA
 # =========================
-def analisar(cve_id, summary, cvss, max_retries=2):
+def validar_analise(data: dict, cve_id: str, cvss=None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+
+    title          = normalizar_texto(data.get("title"))
+    description_pt = normalizar_texto(data.get("description_pt"))
+    severity       = normalizar_texto(data.get("severity"), severity_from_cvss(cvss)).lower()
+
+    if not title or not description_pt:
+        return None
+
+    # Tags: lista de strings, máx 12
+    tags = data.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+    tags = [normalizar_texto(t) for t in tags if normalizar_texto(t)][:12]
+
+    # Campos pentest com fallback para valor padrão se fora do allowed set
+    vetor          = normalizar_texto(data.get("vetor"), "Desconhecido")
+    if vetor not in ALLOWED_VECTOR:
+        vetor = "Desconhecido"
+
+    complexidade   = normalizar_texto(data.get("complexidade"), "Desconhecida")
+    if complexidade not in ALLOWED_COMPLEXITY:
+        complexidade = "Desconhecida"
+
+    autenticacao   = normalizar_texto(data.get("autenticacao"), "Desconhecida")
+    if autenticacao not in ALLOWED_AUTH:
+        autenticacao = "Desconhecida"
+
+    exploit_facilidade = normalizar_texto(data.get("exploit_facilidade"), "Não confirmado")
+
+    # Severity fallback
+    if severity not in ALLOWED_SEVERITIES:
+        severity = severity_from_cvss(cvss)
+
+    # Trunca title se necessário
+    if len(title) > 80:
+        title = title[:77].rstrip() + "..."
+
+    return {
+        "title":             title,
+        "description_pt":    description_pt,
+        "severity":          severity,
+        "tags":              tags,
+        "vetor":             vetor,
+        "complexidade":      complexidade,
+        "autenticacao":      autenticacao,
+        "exploit_facilidade": exploit_facilidade,
+    }
+
+
+# =========================
+# ANÁLISE VIA GROQ (LLAMA)
+# =========================
+def analisar_com_llama(cve_id: str, summary: str, cvss=None, max_retries: int = 2) -> dict | None:
     print(f"🔍 Analisando {cve_id}...")
 
     severity_label = severity_from_cvss(cvss)
-    summary = summary or "Sem resumo disponível."
+    summary        = normalizar_texto(summary, "Sem resumo disponível.")
 
-    prompt = f"""Analise a vulnerabilidade abaixo e responda SOMENTE com JSON válido.
+    prompt = f"""Analise a vulnerabilidade abaixo e responda SOMENTE com um objeto JSON válido, sem texto antes ou depois, sem markdown, sem backticks.
 
 CVE ID: {cve_id}
-CVSS: {cvss}
-Severidade: {severity_label}
-Resumo: {summary}
+CVSS Score: {cvss if cvss is not None else 'N/A'}
+Severidade calculada: {severity_label}
+Resumo original (EN): {summary}
 
-Formato:
+Responda com exatamente este schema JSON:
 {{
-"title": "CVE + produto + tipo da falha (PT-BR, máx 80 chars)",
-"description_pt": "explicação técnica clara em PT-BR (2-4 frases)",
-"severity": "critical | high | medium | low | info",
-"tags": ["RCE", "Windows"],
-"vetor": "Rede | Local | Adjacente | Físico | Desconhecido",
-"complexidade": "Baixa | Média | Alta | Desconhecida",
-"autenticacao": "Nenhuma | Usuário | Administrador | Desconhecida",
-"exploit_facilidade": "curto sobre exploração"
-}}
-"""
+  "title": "string — CVE ID + produto afetado + tipo de vulnerabilidade em PT-BR, máx 80 chars",
+  "description_pt": "string — 2 a 4 frases em PT-BR: o que é a falha, como pode ser explorada, qual o impacto real. Tom técnico e direto. Sem emojis.",
+  "severity": "uma das opções: critical, high, medium, low, info",
+  "tags": ["array", "de", "strings", "ex: RCE, Windows, privilege-escalation, unauthenticated"],
+  "vetor": "string — Rede | Local | Adjacente | Físico | Desconhecido",
+  "complexidade": "string — Baixa | Média | Alta | Desconhecida",
+  "autenticacao": "string — Nenhuma | Usuário | Administrador | Desconhecida",
+  "exploit_facilidade": "string — frase curta sobre dificuldade de exploração"
+}}"""
 
-    for attempt in range(max_retries):
+    system = (
+        "Você é um analisador de CVEs especializado em segurança ofensiva e pentesting. "
+        "Responda sempre em português do Brasil. "
+        "Responda somente com JSON válido, sem nenhum texto adicional, sem markdown."
+    )
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
         try:
-            r = groq_client.chat.completions.create(
+            completion = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
-                    {"role": "system", "content": "Responda somente JSON válido, sem texto extra."},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": prompt},
                 ],
-                temperature=0.1
+                temperature=0.1,
             )
 
-            raw = clean_json(r.choices[0].message.content)
-            data = json.loads(raw)
+            raw       = completion.choices[0].message.content.strip()
+            raw       = clean_json_text(raw)
+            parsed    = json.loads(raw)
+            validated = validar_analise(parsed, cve_id, cvss)
 
-            if not data.get("title") or not data.get("description_pt"):
-                raise ValueError("Resposta incompleta")
+            if validated:
+                return validated
 
-            if data.get("severity") not in ["critical","high","medium","low","info"]:
-                data["severity"] = severity_label
+            print(f"⚠️  Resposta inválida para {cve_id} na tentativa {attempt}")
+            last_error = "validação falhou"
 
-            return data
-
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON inválido para {cve_id} na tentativa {attempt}: {e}")
+            last_error = e
         except Exception as e:
-            print(f"⚠️ Tentativa {attempt+1} falhou:", e)
-            time.sleep(1.5)
+            print(f"❌ Erro na análise de {cve_id} na tentativa {attempt}: {e}")
+            last_error = e
 
+        if attempt < max_retries:
+            time.sleep(1.5 * attempt)   # backoff progressivo
+
+    print(f"❌ Falha final ao analisar {cve_id}: {last_error}")
     return None
 
 
 # =========================
-# SAVE
+# DISCORD — NOTIFY
 # =========================
-def salvar(cve_id, cve, analise):
-    payload = {
-        "title": analise["title"],
-        "description_pt": analise["description_pt"],
-        "severity": analise["severity"],
-        "tags": analise.get("tags", []),
-        "vetor": analise.get("vetor"),
-        "complexidade": analise.get("complexidade"),
-        "autenticacao": analise.get("autenticacao"),
-        "exploit_facilidade": analise.get("exploit_facilidade"),
-        "original_url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-        "cve_id": cve_id,
-        "published_at": cve.get("published") or now_iso(),
-        "published": AUTO_PUBLISH,
-    }
-
-    supabase.table("news_articles").insert(payload).execute()
-
-
-# =========================
-# DISCORD
-# =========================
-def discord(cve_id, analise):
+def enviar_discord(cve_id: str, analise: dict) -> None:
     if not DISCORD_WEBHOOK:
         return
 
-    msg = f"""🚨 {cve_id}
+    severity_emoji = {
+        "critical": "🔴",
+        "high":     "🟠",
+        "medium":   "🟡",
+        "low":      "🟢",
+        "info":     "⚪",
+    }.get(analise["severity"], "⚫")
 
-{analise['title']}
+    msg = (
+        f"🚨 **NOVA CVE: {cve_id}** {severity_emoji}\n"
+        f"**{analise['title']}**\n\n"
+        f"{analise['description_pt']}\n\n"
+        f"**Análise Pentest:**\n"
+        f"• Vetor: {analise.get('vetor', 'Desconhecido')}\n"
+        f"• Complexidade: {analise.get('complexidade', 'Desconhecida')}\n"
+        f"• Autenticação: {analise.get('autenticacao', 'Desconhecida')}\n"
+        f"• Exploit: {analise.get('exploit_facilidade', 'Não confirmado')}\n\n"
+        f"🔗 {NVD_URL_TEMPLATE.format(cve_id=cve_id)}"
+    )
 
-{analise['description_pt']}
-
-🔗 https://nvd.nist.gov/vuln/detail/{cve_id}
-
----
-🤝 Agradecimentos ao Kamaz
-"""
-
-    requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=15)
+    try:
+        resp = session.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=15)
+        if resp.status_code >= 400:
+            print(f"⚠️  Discord retornou {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"⚠️  Falha ao enviar Discord para {cve_id}: {e}")
 
 
 # =========================
-# MAIN
+# PIPELINE PRINCIPAL
 # =========================
-def run():
+def processar_e_postar() -> None:
     init_clients()
 
     cves = coletar_cves()
+    if not cves:
+        print("Nenhuma CVE recebida. Encerrando.")
+        return
 
+    processadas = 0
     for cve in cves:
-        cve_id = cve.get("id")
-
-        if not cve_id or cve_exists(cve_id):
+        cve_id = normalizar_texto(cve.get("id"))
+        if not cve_id:
             continue
 
-        analise = analisar(cve_id, cve["summary"], cve["cvss"])
+        # Deduplicação ANTES da IA (evita gasto de cota)
+        if cve_ja_existe(cve_id):
+            print(f"↩️  Já existe: {cve_id}")
+            continue
+
+        analise = analisar_com_llama(cve_id, cve.get("summary"), cve.get("cvss"))
         if not analise:
             continue
 
         try:
-            salvar(cve_id, cve, analise)
-
+            salvar_no_supabase(analise, cve_id, cve)
             if AUTO_PUBLISH:
-                discord(cve_id, analise)
-
-            print("✅", cve_id)
-
+                enviar_discord(cve_id, analise)
+            print(f"✅ {cve_id} salvo (published={AUTO_PUBLISH})")
+            processadas += 1
         except Exception as e:
-            print("Erro salvar:", e)
+            print(f"❌ Erro ao salvar/enviar {cve_id}: {e}")
 
-        time.sleep(1.2)
+        time.sleep(1.2)   # respeita rate limit do NVD (sem key: 5 req/30s)
+
+    print(f"\n🏁 Pipeline concluído. {processadas}/{len(cves)} CVEs processadas.")
 
 
+# =========================
+# ENTRYPOINT
+# =========================
 if __name__ == "__main__":
-    run()
+    processar_e_postar()
