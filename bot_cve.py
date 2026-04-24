@@ -2,7 +2,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -17,8 +17,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 
 AUTO_PUBLISH = os.getenv("AUTO_PUBLISH", "false").strip().lower() in {"1", "true", "yes", "y"}
-CVE_API_URL = os.getenv("CVE_API_URL", "https://cve.circl.lu/api/last/20")
+
+NVD_API_URL = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0")
+NVD_API_KEY = os.getenv("NVD_API_KEY")
 NVD_URL_TEMPLATE = os.getenv("NVD_URL_TEMPLATE", "https://nvd.nist.gov/vuln/detail/{cve_id}")
+
+NVD_RESULTS_PER_PAGE = int(os.getenv("NVD_RESULTS_PER_PAGE", "20"))
+NVD_DAYS_BACK = int(os.getenv("NVD_DAYS_BACK", "1"))
 
 ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 ALLOWED_VECTOR = {"Rede", "Local", "Adjacente", "Físico", "Desconhecido"}
@@ -26,8 +31,12 @@ ALLOWED_COMPLEXITY = {"Baixa", "Média", "Alta", "Desconhecida"}
 ALLOWED_AUTH = {"Nenhuma", "Usuário", "Administrador", "Desconhecida"}
 
 HEADERS = {
-    "User-Agent": "cve-news-bot/1.0"
+    "User-Agent": "cve-news-bot/2.0",
+    "Accept": "application/json",
 }
+
+if NVD_API_KEY:
+    HEADERS["apiKey"] = NVD_API_KEY
 
 supabase = None
 groq_client = None
@@ -40,11 +49,13 @@ def init_clients():
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados")
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY não configurada")
 
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    groq_client = Groq(api_key=GROQ_API_KEY)
+
+    if GROQ_API_KEY:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    else:
+        groq_client = None
 
 
 def now_iso():
@@ -141,17 +152,128 @@ def validar_analise(data, cve_id, cvss=None):
     }
 
 
-def analisar_com_llama(cve_id, summary, cvss=None, max_retries=2):
+def extrair_cvss(metrics):
+    try:
+        if "cvssMetricV31" in metrics and metrics["cvssMetricV31"]:
+            return metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
+        if "cvssMetricV30" in metrics and metrics["cvssMetricV30"]:
+            return metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
+        if "cvssMetricV2" in metrics and metrics["cvssMetricV2"]:
+            return metrics["cvssMetricV2"][0]["cvssData"]["baseScore"]
+    except Exception:
+        pass
+    return None
+
+
+def extrair_descricao(descriptions):
+    if not isinstance(descriptions, list):
+        return "Sem descrição disponível."
+
+    for desc in descriptions:
+        if desc.get("lang") == "en" and desc.get("value"):
+            return desc.get("value").strip()
+
+    for desc in descriptions:
+        if desc.get("value"):
+            return desc.get("value").strip()
+
+    return "Sem descrição disponível."
+
+
+def extrair_cwe(weaknesses):
+    cwes = []
+
+    if not isinstance(weaknesses, list):
+        return cwes
+
+    for item in weaknesses:
+        descriptions = item.get("description", [])
+        if not isinstance(descriptions, list):
+            continue
+        for desc in descriptions:
+            val = normalizar_texto(desc.get("value"))
+            if val and val != "NVD-CWE-noinfo" and val != "NVD-CWE-Other":
+                cwes.append(val)
+
+    seen = set()
+    out = []
+    for cwe in cwes:
+        if cwe not in seen:
+            seen.add(cwe)
+            out.append(cwe)
+    return out[:10]
+
+
+def extrair_referencias(references):
+    refs = []
+
+    if not isinstance(references, list):
+        return refs
+
+    for ref in references:
+        url = normalizar_texto(ref.get("url"))
+        source = normalizar_texto(ref.get("source"))
+        tags = ref.get("tags", [])
+        if url:
+            refs.append({
+                "url": url,
+                "source": source,
+                "tags": tags if isinstance(tags, list) else [],
+            })
+
+    return refs[:10]
+
+
+def formatar_data_nvd(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def montar_item_nvd(cve_data):
+    cve_id = normalizar_texto(cve_data.get("id"))
+
+    if not re.match(r"^CVE-\d{4}-\d{4,}$", cve_id):
+        return None
+
+    descriptions = cve_data.get("descriptions", [])
+    metrics = cve_data.get("metrics", {})
+    weaknesses = cve_data.get("weaknesses", [])
+    references = cve_data.get("references", [])
+
+    summary = extrair_descricao(descriptions)
+    cvss = extrair_cvss(metrics)
+    cwes = extrair_cwe(weaknesses)
+    refs = extrair_referencias(references)
+
+    return {
+        "id": cve_id,
+        "summary": summary,
+        "cvss": cvss,
+        "published": cve_data.get("published"),
+        "lastModified": cve_data.get("lastModified"),
+        "cwes": cwes,
+        "references": refs,
+        "raw": cve_data,
+    }
+
+
+def analisar_com_llama(cve_id, summary, cvss=None, cwes=None, references=None, max_retries=2):
+    if groq_client is None:
+        raise RuntimeError("GROQ_API_KEY não configurada")
+
     print(f"🔍 Analisando {cve_id}...")
 
     severity_label = severity_from_cvss(cvss)
     summary = normalizar_texto(summary, "Sem resumo disponível.")
+    cwes_txt = ", ".join(cwes or []) if cwes else "Nenhum CWE explícito"
+    refs_txt = ", ".join([r.get("url", "") for r in (references or [])[:5] if r.get("url")]) or "Sem referências"
 
     prompt = f"""Analise a vulnerabilidade abaixo e responda SOMENTE com um objeto JSON válido, sem texto antes ou depois, sem markdown, sem backticks.
 
 CVE ID: {cve_id}
 CVSS Score: {cvss if cvss is not None else 'N/A'}
 Severidade calculada: {severity_label}
+CWE(s): {cwes_txt}
+Referências: {refs_txt}
 Resumo original (EN): {summary}
 
 Responda com exatamente este schema JSON:
@@ -263,32 +385,64 @@ def enviar_discord(cve_id, analise):
 
 
 def coletar_cves():
-    print("📡 Coletando CVEs...")
-    resp = session.get(CVE_API_URL, timeout=20)
-    resp.raise_for_status()
+    print("📡 Coletando CVEs do NVD...")
 
-    data = resp.json()
-    if isinstance(data, list):
-        return data
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=max(NVD_DAYS_BACK, 0)) if NVD_DAYS_BACK > 0 else None
 
-    if isinstance(data, dict):
-        for key in ("cves", "items", "results", "data"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
+    cves = []
+    start_index = 0
+    results_per_page = max(1, min(NVD_RESULTS_PER_PAGE, 2000))
 
-    raise RuntimeError("Formato inesperado da API de CVEs")
+    while len(cves) < NVD_RESULTS_PER_PAGE:
+        params = {
+            "resultsPerPage": min(results_per_page, NVD_RESULTS_PER_PAGE - len(cves)),
+            "startIndex": start_index,
+            "noRejected": "true",
+        }
+
+        if start is not None:
+            params["pubStartDate"] = formatar_data_nvd(start)
+            params["pubEndDate"] = formatar_data_nvd(now)
+
+        resp = session.get(NVD_API_URL, params=params, timeout=30)
+        resp.raise_for_status()
+
+        data = resp.json()
+        vulns = data.get("vulnerabilities", [])
+
+        if not vulns:
+            break
+
+        for item in vulns:
+            cve_data = item.get("cve", {})
+            montado = montar_item_nvd(cve_data)
+            if montado:
+                cves.append(montado)
+                if len(cves) >= NVD_RESULTS_PER_PAGE:
+                    break
+
+        start_index += len(vulns)
+
+        total_results = data.get("totalResults", 0)
+        if start_index >= total_results:
+            break
+
+    return cves
 
 
 def processar_e_postar():
     init_clients()
 
     cves = coletar_cves()
-    print(f"📦 {len(cves)} CVEs recebidas")
+    print(f"📦 {len(cves)} CVEs recebidas do NVD")
 
     for cve in cves:
         cve_id = normalizar_texto(cve.get("id"))
         summary = cve.get("summary")
         cvss = cve.get("cvss")
+        cwes = cve.get("cwes", [])
+        references = cve.get("references", [])
 
         if not cve_id:
             continue
@@ -297,7 +451,12 @@ def processar_e_postar():
             print(f"↩️ Já existe: {cve_id}")
             continue
 
-        analise = analisar_com_llama(cve_id, summary, cvss)
+        try:
+            analise = analisar_com_llama(cve_id, summary, cvss, cwes=cwes, references=references)
+        except Exception as e:
+            print(f"❌ Erro ao analisar {cve_id}: {e}")
+            continue
+
         if not analise:
             continue
 
