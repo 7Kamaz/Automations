@@ -30,7 +30,7 @@ NVD_API_KEY = os.getenv("NVD_API_KEY")
 NVD_RESULTS_PER_PAGE = int(os.getenv("NVD_RESULTS_PER_PAGE", "20"))
 
 HEADERS = {
-    "User-Agent": "kamaz-intel-bot/3.0",
+    "User-Agent": "kamaz-intel-bot/3.1",
     "Accept": "application/json",
 }
 
@@ -118,7 +118,7 @@ def coletar_cves():
         cvss = None
 
         for k in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]:
-            if k in metrics:
+            if k in metrics and metrics[k]:
                 cvss = metrics[k][0]["cvssData"]["baseScore"]
                 break
 
@@ -146,40 +146,59 @@ def cve_exists(cve_id):
 # =========================
 # LLM
 # =========================
-def analisar(cve_id, summary, cvss):
-    print("🔍", cve_id)
+def analisar(cve_id, summary, cvss, max_retries=2):
+    print(f"🔍 Analisando {cve_id}...")
 
-    prompt = f"""
-CVE: {cve_id}
+    severity_label = severity_from_cvss(cvss)
+    summary = summary or "Sem resumo disponível."
+
+    prompt = f"""Analise a vulnerabilidade abaixo e responda SOMENTE com JSON válido.
+
+CVE ID: {cve_id}
 CVSS: {cvss}
-Summary: {summary}
+Severidade: {severity_label}
+Resumo: {summary}
 
-Return JSON:
+Formato:
 {{
-"title":"",
-"description_pt":"",
-"severity":"",
-"tags":[],
-"vetor":"",
-"complexidade":"",
-"autenticacao":"",
-"exploit_facilidade":""
+"title": "CVE + produto + tipo da falha (PT-BR, máx 80 chars)",
+"description_pt": "explicação técnica clara em PT-BR (2-4 frases)",
+"severity": "critical | high | medium | low | info",
+"tags": ["RCE", "Windows"],
+"vetor": "Rede | Local | Adjacente | Físico | Desconhecido",
+"complexidade": "Baixa | Média | Alta | Desconhecida",
+"autenticacao": "Nenhuma | Usuário | Administrador | Desconhecida",
+"exploit_facilidade": "curto sobre exploração"
 }}
 """
 
-    try:
-        r = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
+    for attempt in range(max_retries):
+        try:
+            r = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": "Responda somente JSON válido, sem texto extra."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1
+            )
 
-        raw = clean_json(r.choices[0].message.content)
-        return json.loads(raw)
+            raw = clean_json(r.choices[0].message.content)
+            data = json.loads(raw)
 
-    except Exception as e:
-        print("Erro LLM:", e)
-        return None
+            if not data.get("title") or not data.get("description_pt"):
+                raise ValueError("Resposta incompleta")
+
+            if data.get("severity") not in ["critical","high","medium","low","info"]:
+                data["severity"] = severity_label
+
+            return data
+
+        except Exception as e:
+            print(f"⚠️ Tentativa {attempt+1} falhou:", e)
+            time.sleep(1.5)
+
+    return None
 
 
 # =========================
@@ -218,9 +237,12 @@ def discord(cve_id, analise):
 {analise['description_pt']}
 
 🔗 https://nvd.nist.gov/vuln/detail/{cve_id}
+
+---
+🤝 Agradecimentos ao Kamaz
 """
 
-    requests.post(DISCORD_WEBHOOK, json={"content": msg})
+    requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=15)
 
 
 # =========================
