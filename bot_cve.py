@@ -1,5 +1,5 @@
 """ 
-bot_cve.py — Kamaz Intel Bot v4.3
+bot_cve.py — Kamaz Intel Bot v4.4
 Fonte: NVD API v2.0
 Pipeline: NVD → Groq (llama-3.3-70b-versatile) → Supabase (news_articles) → Discord
 GitHub Actions: roda a cada hora via cron "0 * * * *"
@@ -28,23 +28,23 @@ DISCORD_WEBHOOK           = os.getenv("DISCORD_WEBHOOK_URL")
 AUTO_PUBLISH              = os.getenv("AUTO_PUBLISH", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 # NVD
-_nvd_base          = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0/")
-NVD_API_URL        = _nvd_base if _nvd_base.endswith("/") else _nvd_base + "/"
-NVD_API_KEY        = os.getenv("NVD_API_KEY")          # opcional mas aumenta rate limit
+_nvd_base            = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0/")
+NVD_API_URL          = _nvd_base if _nvd_base.endswith("/") else _nvd_base + "/"
+NVD_API_KEY          = os.getenv("NVD_API_KEY")
 NVD_RESULTS_PER_PAGE = int(os.getenv("NVD_RESULTS_PER_PAGE", "20"))
 NVD_LOOKBACK_MINUTES = int(os.getenv("NVD_LOOKBACK_MINUTES", "65"))
-NVD_URL_TEMPLATE   = "https://nvd.nist.gov/vuln/detail/{cve_id}"
+NVD_URL_TEMPLATE     = "https://nvd.nist.gov/vuln/detail/{cve_id}"
 
-GROQ_TIMEOUT = float(os.getenv("GROQ_TIMEOUT", "60"))
+GROQ_TIMEOUT     = float(os.getenv("GROQ_TIMEOUT", "60"))
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "3"))
 
 # Conjuntos de validação para payload da IA
-ALLOWED_SEVERITIES  = {"critical", "high", "medium", "low", "info"}
-ALLOWED_VECTOR      = {"Rede", "Local", "Adjacente", "Físico", "Desconhecido"}
-ALLOWED_COMPLEXITY  = {"Baixa", "Média", "Alta", "Desconhecida"}
-ALLOWED_AUTH        = {"Nenhuma", "Usuário", "Administrador", "Desconhecida"}
+ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
+ALLOWED_VECTOR     = {"Rede", "Local", "Adjacente", "Físico", "Desconhecido"}
+ALLOWED_COMPLEXITY = {"Baixa", "Média", "Alta", "Desconhecida"}
+ALLOWED_AUTH       = {"Nenhuma", "Usuário", "Administrador", "Desconhecida"}
 
-HEADERS = {"User-Agent": "kamaz-intel-bot/4.3", "Accept": "application/json"}
+HEADERS = {"User-Agent": "kamaz-intel-bot/4.4", "Accept": "application/json"}
 
 # Estado global
 supabase = None
@@ -103,7 +103,6 @@ def severity_from_cvss(cvss) -> str:
 
 
 def clean_json_text(raw: str) -> str:
-    """Remove blocos markdown e isola o objeto JSON."""
     if not raw:
         return ""
     raw = raw.strip()
@@ -126,84 +125,68 @@ def coletar_cves() -> list:
 
     agora  = datetime.now(timezone.utc)
     inicio = agora - timedelta(minutes=NVD_LOOKBACK_MINUTES)
+    limite_publicacao = agora - timedelta(days=7)  # só CVEs publicadas nos últimos 7 dias
 
-    params_base = {
+    params = {
         "lastModStartDate": iso_z(inicio),
         "lastModEndDate":   iso_z(agora),
         "resultsPerPage":   NVD_RESULTS_PER_PAGE,
         "startIndex":       0,
     }
 
-    cves         = []
-    total_results = None
-    start_index  = 0
+    try:
+        resp = session.get(NVD_API_URL, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"❌ Erro ao buscar CVEs do NVD: {e}")
+        return []
 
-    while True:
-        params = dict(params_base)
-        params["startIndex"] = start_index
+    total_results = data.get("totalResults", 0)
+    print(f"📊 totalResults={total_results} | janela={NVD_LOOKBACK_MINUTES} min | pegando top {NVD_RESULTS_PER_PAGE}")
 
+    cves = []
+    for item in data.get("vulnerabilities", []):
+        cve_data = item.get("cve", {})
+        cve_id   = cve_data.get("id")
+        if not cve_id:
+            continue
+
+        published = cve_data.get("published", "")
+
+        # Só CVEs publicadas nos últimos 7 dias — ignora históricas modificadas recentemente
         try:
-            resp = session.get(NVD_API_URL, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"❌ Erro ao buscar CVEs do NVD: {e}")
-            return []
+            if published:
+                pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                if pub_dt < limite_publicacao:
+                    print(f"⏭️  {cve_id} ignorada (publicada em {published[:10]})")
+                    continue
+        except Exception:
+            pass
 
-        if total_results is None:
-            total_results = data.get("totalResults", 0)
-            print(f"📊 totalResults={total_results} | janela={NVD_LOOKBACK_MINUTES} min")
+        summary = next(
+            (d.get("value", "") for d in cve_data.get("descriptions", []) if d.get("lang") == "en"),
+            ""
+        )
 
-        vulnerabilities = data.get("vulnerabilities", [])
-        if not vulnerabilities:
-            break
+        metrics = cve_data.get("metrics", {})
+        cvss    = None
+        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            if key in metrics and metrics[key]:
+                try:
+                    cvss = metrics[key][0]["cvssData"]["baseScore"]
+                    break
+                except (KeyError, IndexError, TypeError):
+                    continue
 
-        for item in vulnerabilities:
-            cve_data = item.get("cve", {})
-            cve_id   = cve_data.get("id")
-            if not cve_id:
-                continue
+        cves.append({
+            "id":        cve_id,
+            "summary":   summary,
+            "cvss":      cvss,
+            "published": published,
+        })
 
-            summary = next(
-                (d.get("value", "") for d in cve_data.get("descriptions", []) if d.get("lang") == "en"),
-                ""
-            )
-
-            metrics = cve_data.get("metrics", {})
-            cvss    = None
-            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-                if key in metrics and metrics[key]:
-                    try:
-                        cvss = metrics[key][0]["cvssData"]["baseScore"]
-                        break
-                    except (KeyError, IndexError, TypeError):
-                        continue
-
-            published = cve_data.get("published", "")
-            # Ignora CVEs antigas — só aceita publicadas nos últimos 30 dias
-            try:
-                if published:
-                    pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-                    if pub_dt < agora - timedelta(days=30):
-                        print(f"⏭️  Ignorando {cve_id} (publicada em {published[:10]})")
-                        continue
-            except Exception:
-                pass
-
-            cves.append({
-                "id":        cve_id,
-                "summary":   summary,
-                "cvss":      cvss,
-                "published": published,
-            })
-
-        start_index += len(vulnerabilities)
-        if total_results is not None and start_index >= total_results:
-            break
-
-        time.sleep(0.7)
-
-    print(f"📦 {len(cves)} CVEs recebidas")
+    print(f"📦 {len(cves)} CVEs recentes para processar")
     return cves
 
 
@@ -425,7 +408,7 @@ def processar_e_postar() -> None:
 
     cves = coletar_cves()
     if not cves:
-        print("ℹ️  Nenhuma CVE nova publicada na janela. Encerrando.")
+        print("ℹ️  Nenhuma CVE recente na janela. Encerrando.")
         return
 
     processadas = 0
