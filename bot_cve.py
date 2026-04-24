@@ -9,7 +9,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from dotenv import load_dotenv
@@ -32,7 +32,8 @@ AUTO_PUBLISH              = os.getenv("AUTO_PUBLISH", "false").strip().lower() i
 _nvd_base          = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0/")
 NVD_API_URL        = _nvd_base if _nvd_base.endswith("/") else _nvd_base + "/"
 NVD_API_KEY        = os.getenv("NVD_API_KEY")          # opcional mas aumenta rate limit
-NVD_RESULTS_PER_PAGE = int(os.getenv("NVD_RESULTS_PER_PAGE", "20"))
+NVD_RESULTS_PER_PAGE = int(os.getenv("NVD_RESULTS_PER_PAGE", "2000"))
+NVD_LOOKBACK_MINUTES = int(os.getenv("NVD_LOOKBACK_MINUTES", "65"))
 NVD_URL_TEMPLATE   = "https://nvd.nist.gov/vuln/detail/{cve_id}"
 
 # Conjuntos de validação para payload da IA
@@ -73,6 +74,10 @@ def init_clients():
 # =========================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def normalizar_texto(valor, padrao: str = "") -> str:
@@ -120,46 +125,78 @@ def clean_json_text(raw: str) -> str:
 # =========================
 def coletar_cves() -> list:
     print("📡 Coletando CVEs do NVD...")
-    params = {"resultsPerPage": NVD_RESULTS_PER_PAGE}
 
-    try:
-        resp = session.get(NVD_API_URL, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"❌ Erro ao buscar CVEs do NVD: {e}")
-        return []
+    agora = datetime.now(timezone.utc)
+    inicio = agora - timedelta(minutes=NVD_LOOKBACK_MINUTES)
+
+    params_base = {
+        "lastModStartDate": iso_z(inicio),
+        "lastModEndDate": iso_z(agora),
+        "resultsPerPage": NVD_RESULTS_PER_PAGE,
+        "startIndex": 0,
+        "noRejected": "true",
+    }
 
     cves = []
-    for item in data.get("vulnerabilities", []):
-        cve_data = item.get("cve", {})
-        cve_id   = cve_data.get("id")
-        if not cve_id:
-            continue
+    total_results = None
+    start_index = 0
 
-        # Descrição em inglês
-        summary = next(
-            (d["value"] for d in cve_data.get("descriptions", []) if d["lang"] == "en"),
-            ""
-        )
+    while True:
+        params = dict(params_base)
+        params["startIndex"] = start_index
 
-        # CVSS — tenta v3.1, v3.0, v2 em ordem
-        metrics = cve_data.get("metrics", {})
-        cvss    = None
-        for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
-            if key in metrics and metrics[key]:
-                try:
-                    cvss = metrics[key][0]["cvssData"]["baseScore"]
-                    break
-                except (KeyError, IndexError):
-                    continue
+        try:
+            resp = session.get(NVD_API_URL, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"❌ Erro ao buscar CVEs do NVD: {e}")
+            return []
 
-        cves.append({
-            "id":        cve_id,
-            "summary":   summary,
-            "cvss":      cvss,
-            "published": cve_data.get("published"),
-        })
+        if total_results is None:
+            total_results = data.get("totalResults", 0)
+            print(f"📊 totalResults={total_results} | janela={NVD_LOOKBACK_MINUTES} min | startIndex={start_index}")
+
+        vulnerabilities = data.get("vulnerabilities", [])
+        if not vulnerabilities:
+            break
+
+        for item in vulnerabilities:
+            cve_data = item.get("cve", {})
+            cve_id   = cve_data.get("id")
+            if not cve_id:
+                continue
+
+            # Descrição em inglês
+            summary = next(
+                (d.get("value", "") for d in cve_data.get("descriptions", []) if d.get("lang") == "en"),
+                ""
+            )
+
+            # CVSS — tenta v3.1, v3.0, v2 em ordem
+            metrics = cve_data.get("metrics", {})
+            cvss    = None
+            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                if key in metrics and metrics[key]:
+                    try:
+                        cvss = metrics[key][0]["cvssData"]["baseScore"]
+                        break
+                    except (KeyError, IndexError, TypeError):
+                        continue
+
+            cves.append({
+                "id":        cve_id,
+                "summary":   summary,
+                "cvss":      cvss,
+                "published": cve_data.get("published"),
+            })
+
+        start_index += len(vulnerabilities)
+
+        if total_results is not None and start_index >= total_results:
+            break
+
+        time.sleep(0.7)
 
     print(f"📦 {len(cves)} CVEs recebidas")
     return cves
@@ -222,13 +259,13 @@ def validar_analise(data: dict, cve_id: str, cvss=None) -> dict | None:
         title = title[:77].rstrip() + "..."
 
     return {
-        "title":             title,
-        "description_pt":    description_pt,
-        "severity":          severity,
-        "tags":              tags,
-        "vetor":             vetor,
-        "complexidade":      complexidade,
-        "autenticacao":      autenticacao,
+        "title":              title,
+        "description_pt":     description_pt,
+        "severity":           severity,
+        "tags":               tags,
+        "vetor":              vetor,
+        "complexidade":       complexidade,
+        "autenticacao":       autenticacao,
         "exploit_facilidade": exploit_facilidade,
     }
 
@@ -302,6 +339,38 @@ Responda com exatamente este schema JSON:
 
     print(f"❌ Falha final ao analisar {cve_id}: {last_error}")
     return None
+
+
+# =========================
+# SUPABASE — SAVE
+# =========================
+def salvar_no_supabase(analise: dict, cve_id: str, cve: dict) -> None:
+    payload = {
+        "cve_id": cve_id,
+        "title": analise.get("title"),
+        "description_pt": analise.get("description_pt"),
+        "severity": analise.get("severity"),
+        "tags": analise.get("tags", []),
+        "vetor": analise.get("vetor", "Desconhecido"),
+        "complexidade": analise.get("complexidade", "Desconhecida"),
+        "autenticacao": analise.get("autenticacao", "Desconhecida"),
+        "exploit_facilidade": analise.get("exploit_facilidade", "Não confirmado"),
+        "cvss": cve.get("cvss"),
+        "published": cve.get("published"),
+        "source": "NVD",
+        "source_url": NVD_URL_TEMPLATE.format(cve_id=cve_id),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    try:
+        res = supabase.table("news_articles").insert(payload).execute()
+        if getattr(res, "error", None):
+            raise RuntimeError(str(res.error))
+        return
+    except Exception as e:
+        print(f"❌ Falha ao inserir {cve_id} no Supabase: {e}")
+        raise
 
 
 # =========================
