@@ -19,7 +19,7 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 AUTO_PUBLISH = os.getenv("AUTO_PUBLISH", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 # Endpoint oficial do NVD CVE API 2.0
-NVD_API_URL = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0/")
+NVD_API_URL = os.getenv("NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0")
 NVD_API_KEY = os.getenv("NVD_API_KEY")
 NVD_URL_TEMPLATE = os.getenv("NVD_URL_TEMPLATE", "https://nvd.nist.gov/vuln/detail/{cve_id}")
 
