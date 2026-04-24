@@ -132,7 +132,6 @@ def coletar_cves() -> list:
         "lastModEndDate":   iso_z(agora),
         "resultsPerPage":   NVD_RESULTS_PER_PAGE,
         "startIndex":       0,
-        "noRejected":       "true",
     }
 
     cves         = []
@@ -181,11 +180,13 @@ def coletar_cves() -> list:
                         continue
 
             published = cve_data.get("published", "")
-            # Ignora CVEs antigas — NVD retorna históricas quando modified recentemente
+            # Ignora CVEs antigas — só aceita publicadas nos últimos 30 dias
             try:
-                if published and int(published[:4]) < 2020:
-                    print(f"⏭️  Ignorando {cve_id} (publicada em {published[:4]})")
-                    continue
+                if published:
+                    pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                    if pub_dt < agora - timedelta(days=30):
+                        print(f"⏭️  Ignorando {cve_id} (publicada em {published[:10]})")
+                        continue
             except Exception:
                 pass
 
