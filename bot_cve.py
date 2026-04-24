@@ -50,16 +50,14 @@ HEADERS = {"User-Agent": "kamaz-intel-bot/4.4", "Accept": "application/json"}
 supabase = None
 session  = requests.Session()
 session.headers.update(HEADERS)
-if NVD_API_KEY:
-    session.headers.update({"apiKey": NVD_API_KEY})
-
 
 # =========================
 # INICIALIZAÇÃO
 # =========================
 def init_clients():
     global supabase
-
+    if NVD_API_KEY:
+        session.headers.update({"apiKey": NVD_API_KEY})
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados")
     if not GROQ_API_KEY:
