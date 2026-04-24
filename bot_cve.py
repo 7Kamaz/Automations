@@ -1,4 +1,4 @@
-"""
+""" 
 bot_cve.py — Kamaz Intel Bot v4.0
 Fonte: NVD API v2.0
 Pipeline: NVD → Groq (llama-3.3-70b-versatile) → Supabase (news_articles) → Discord
