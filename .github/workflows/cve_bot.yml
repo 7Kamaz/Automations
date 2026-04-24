@@ -2,9 +2,8 @@ name: Kamaz Intelligence Bot
 
 on:
 schedule:
-# Roda a cada 1 hora (Cron: minuto 0 de cada hora)
 - cron: '0 * * * *'
-workflow_dispatch: # Permite rodar manualmente pelo botão no GitHub
+workflow_dispatch:
 
 jobs:
 build:
@@ -26,7 +25,6 @@ pip install -r requirements.txt
 
 - name: Rodar o Bot
 env:
-# Mapeia os Secrets do GitHub para as variáveis de ambiente que o script usa
 SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
 SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
