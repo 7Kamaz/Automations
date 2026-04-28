@@ -1,8 +1,13 @@
 """ 
-bot_cve.py — Kamaz Intel Bot v4.4
+bot_cve.py — Kamaz Intel Bot v4.5
 Fonte: NVD API v2.0
 Pipeline: NVD → Groq (llama-3.3-70b-versatile) → Supabase (news_articles) → Discord
 GitHub Actions: roda a cada hora via cron "0 * * * *"
+
+Changelog v4.5:
+- Filtra apenas CVEs com CVSS >= 9.0 (Critical)
+- Marco zero: ignora CVEs publicadas antes de 27/04/2026
+- Discord: destaque visual extra para Critical
 """
 
 import json
@@ -38,13 +43,21 @@ NVD_URL_TEMPLATE     = "https://nvd.nist.gov/vuln/detail/{cve_id}"
 GROQ_TIMEOUT     = float(os.getenv("GROQ_TIMEOUT", "60"))
 GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "3"))
 
+# Marco zero — Problema 3b
+# Ignora CVEs publicadas antes desta data. Ajuste conforme necessário.
+MARCO_ZERO = datetime(2026, 4, 27, tzinfo=timezone.utc)
+
+# CVSS mínimo para processamento — Problema 3a
+# Apenas Critical (>= 9.0) entram no pipeline.
+CVSS_MINIMO = 9.0
+
 # Conjuntos de validação para payload da IA
 ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 ALLOWED_VECTOR     = {"Rede", "Local", "Adjacente", "Físico", "Desconhecido"}
 ALLOWED_COMPLEXITY = {"Baixa", "Média", "Alta", "Desconhecida"}
 ALLOWED_AUTH       = {"Nenhuma", "Usuário", "Administrador", "Desconhecida"}
 
-HEADERS = {"User-Agent": "kamaz-intel-bot/4.4", "Accept": "application/json"}
+HEADERS = {"User-Agent": "kamaz-intel-bot/4.5", "Accept": "application/json"}
 
 # Estado global
 supabase = None
@@ -91,7 +104,9 @@ def severity_from_cvss(cvss) -> str:
         if cvss is None or cvss == "":
             return "info"
         score = float(cvss)
-        if score >= 9.0: return "critical"
+        if score >= 9.0:
+            print(f"🔴 CVSS {score:.1f} → CRITICAL")
+            return "critical"
         if score >= 7.0: return "high"
         if score >= 4.0: return "medium"
         if score > 0:    return "low"
@@ -120,10 +135,10 @@ def clean_json_text(raw: str) -> str:
 # =========================
 def coletar_cves() -> list:
     print("📡 Coletando CVEs do NVD...")
+    print(f"🗓️  Marco zero: {MARCO_ZERO.date()} | Filtro CVSS mínimo: {CVSS_MINIMO} (Critical only)")
 
     agora  = datetime.now(timezone.utc)
     inicio = agora - timedelta(minutes=NVD_LOOKBACK_MINUTES)
-    limite_publicacao = agora - timedelta(days=7)  # só CVEs publicadas nos últimos 7 dias
 
     params = {
         "lastModStartDate": iso_z(inicio),
@@ -152,12 +167,12 @@ def coletar_cves() -> list:
 
         published = cve_data.get("published", "")
 
-        # Só CVEs publicadas nos últimos 7 dias — ignora históricas modificadas recentemente
+        # Problema 3b — Marco zero: ignorar CVEs anteriores a MARCO_ZERO
         try:
             if published:
                 pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-                if pub_dt < limite_publicacao:
-                    print(f"⏭️  {cve_id} ignorada (publicada em {published[:10]})")
+                if pub_dt < MARCO_ZERO:
+                    print(f"⏭️  {cve_id} ignorada (anterior ao marco zero {MARCO_ZERO.date()})")
                     continue
         except Exception:
             pass
@@ -177,6 +192,11 @@ def coletar_cves() -> list:
                 except (KeyError, IndexError, TypeError):
                     continue
 
+        # Problema 3a — Filtrar apenas Critical (CVSS >= 9.0)
+        if cvss is None or float(cvss) < CVSS_MINIMO:
+            print(f"⏭️  {cve_id} ignorada (CVSS={cvss} — não é Critical)")
+            continue
+
         cves.append({
             "id":        cve_id,
             "summary":   summary,
@@ -184,7 +204,7 @@ def coletar_cves() -> list:
             "published": published,
         })
 
-    print(f"📦 {len(cves)} CVEs recentes para processar")
+    print(f"📦 {len(cves)} CVEs Critical para processar")
     return cves
 
 
@@ -378,8 +398,18 @@ def enviar_discord(cve_id: str, analise: dict) -> None:
         "info":     "⚪",
     }.get(analise["severity"], "⚫")
 
+    # Problema 3c — destaque extra para Critical
+    critical_banner = ""
+    if analise["severity"] == "critical":
+        critical_banner = (
+            "```\n"
+            "⚠️  ATENÇÃO: SEVERIDADE CRÍTICA — CVSS ≥ 9.0\n"
+            "```\n"
+        )
+
     msg = (
         f"🚨 **NOVA CVE: {cve_id}** {severity_emoji}\n"
+        f"{critical_banner}"
         f"**{analise['title']}**\n\n"
         f"{analise['description_pt']}\n\n"
         f"**Análise Pentest:**\n"
@@ -406,7 +436,7 @@ def processar_e_postar() -> None:
 
     cves = coletar_cves()
     if not cves:
-        print("ℹ️  Nenhuma CVE recente na janela. Encerrando.")
+        print("ℹ️  Nenhuma CVE Critical recente na janela. Encerrando.")
         return
 
     processadas = 0
